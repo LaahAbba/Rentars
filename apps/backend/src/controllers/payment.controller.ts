@@ -149,6 +149,12 @@ const submitSchema = z.object({
  *
  * Body: { bookingId, signedXdr, amountStroops, currency, quoteHash, expiresAt, metadata? }
  * Returns: { paymentId, status }
+ *
+ * Error codes:
+ *   400 VALIDATION_ERROR          — malformed request body
+ *   429 PAYMENT_ATTEMPT_LIMIT_EXCEEDED — booking or actor attempt limit hit
+ *   503 PAYMENT_CIRCUIT_OPEN      — provider unavailable (circuit tripped)
+ *   502 TX_SUBMIT_FAILED          — Stellar submission error
  */
 export async function submitPayment(req: AuthRequest, res: Response): Promise<void> {
   const parsed = submitSchema.safeParse(req.body);
@@ -259,8 +265,10 @@ export async function submitPayment(req: AuthRequest, res: Response): Promise<vo
     const result = await submitTransaction(signedXdr);
     txHash = result.txHash;
     await updatePaymentStatus(payment.id, txHash, 'submitted');
+    await recordSuccess('stellar_horizon');
   } catch (err) {
     await updatePaymentStatus(payment.id, null, 'failed');
+    await recordFailure('stellar_horizon');
     res.status(502).json({
       error: {
         code: 'TX_SUBMIT_FAILED',
@@ -331,7 +339,18 @@ const retrySchema = z.object({
  * Retries a failed or timed-out payment safely.
  * If the payment already has a txHash, it re-polls instead of re-submitting.
  *
+ * Retries count against the attempt limits and are subject to circuit
+ * breaker checks exactly like original submissions.
+ *
  * Body: { signedXdr? } — only required if no txHash exists on the payment.
+ *
+ * Error codes:
+ *   400 VALIDATION_ERROR          — malformed request body
+ *   404 NOT_FOUND                 — payment not found
+ *   403 FORBIDDEN                 — caller is not the owning tenant
+ *   429 PAYMENT_ATTEMPT_LIMIT_EXCEEDED — attempt limit hit
+ *   503 PAYMENT_CIRCUIT_OPEN      — provider unavailable
+ *   422 RETRY_FAILED              — retry logic failed
  */
 export async function retryPayment(req: AuthRequest, res: Response): Promise<void> {
   const id = req.params.id;
@@ -355,6 +374,38 @@ export async function retryPayment(req: AuthRequest, res: Response): Promise<voi
   if (payment.tenant_id !== req.userId) {
     res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Access denied' } });
     return;
+  }
+
+  const tenantId = req.userId!;
+
+  // ── Attempt limiter ────────────────────────────────────────────────────────
+  const attemptResult = await checkAndIncrementAttempts(payment.booking_id, tenantId);
+  if (!attemptResult.allowed) {
+    res.status(429).json({
+      error: {
+        code: 'PAYMENT_ATTEMPT_LIMIT_EXCEEDED',
+        message: 'Too many payment attempts. Please try again later.',
+        retryAfterSeconds: attemptResult.retryAfterSeconds ?? 3600,
+      },
+    });
+    return;
+  }
+
+  // ── Circuit breaker ────────────────────────────────────────────────────────
+  try {
+    await checkCircuit('stellar_horizon');
+  } catch (err) {
+    if (err instanceof PaymentCircuitOpenError) {
+      res.status(503).json({
+        error: {
+          code: 'PAYMENT_CIRCUIT_OPEN',
+          message: 'Payment processing is temporarily unavailable. Please try again in a few minutes.',
+          retryAfterSeconds: Math.ceil(err.retryAfterMs / 1000),
+        },
+      });
+      return;
+    }
+    throw err;
   }
 
   try {
